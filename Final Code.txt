@@ -1,0 +1,268 @@
+import streamlit as st
+from pypdf import PdfReader
+from docx import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from google import genai
+from dotenv import load_dotenv
+from PIL import Image
+from fpdf import FPDF
+from pptx import Presentation
+import json
+import os
+
+load_dotenv()
+
+api_key = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=api_key)
+
+CHAT_FILE = "chat_history.json"
+
+# =========================
+# HELPER FUNCTIONS
+# =========================
+def load_chats():
+    if os.path.exists(CHAT_FILE):
+        with open(CHAT_FILE, "r") as f:
+            return json.load(f)
+    return {"Chat 1": []}
+
+def save_chats(chats):
+    with open(CHAT_FILE, "w") as f:
+        json.dump(chats, f)
+
+def get_text_chunks(text):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    return splitter.split_text(text)
+
+def get_vector_store(chunks):
+    embeddings = HuggingFaceEmbeddings()
+    return FAISS.from_texts(chunks, embedding=embeddings)
+
+# =========================
+# PAGE CONFIG & CSS
+# =========================
+st.set_page_config(page_title="AI StudyMate", page_icon="📚", layout="centered")
+
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #ffffff; color: black; }
+    .block-container { padding-top: 2rem; padding-bottom: 6rem; max-width: 750px; }
+    .user-bubble { background: #DCF2FF; color: black; padding: 10px 14px; border-radius: 14px; margin: 8px 0; max-width: 75%; margin-left: auto; font-size: 15px; }
+    .ai-bubble { background: #F3F4F6; color: black; padding: 10px 14px; border-radius: 14px; margin: 8px 0; max-width: 75%; margin-right: auto; font-size: 15px; border: 1px solid #e5e7eb; }
+    [data-testid="stFileUploader"] { border: 1px solid #e5e7eb; padding: 12px; border-radius: 12px; background: #fafafa; }
+    div[data-testid="stChatInput"] { padding: 10px; }
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;}
+    [data-testid="stFileUploader"] section div { color: black !important; }
+    [data-testid="stFileUploader"] label { color: black !important; }
+    [data-testid="stFileUploader"] button *, [data-testid="stFileUploader"] button { color: white !important; }
+    header[data-testid="stHeader"] { background-color: white !important; box-shadow: none !important; }
+    [data-testid="stFileUploader"] button { background-color: #1E1E1E !important; color: #ffffff !important; border: none !important; }
+    [data-testid="stFileUploader"] button * { color: #ffffff !important; }
+    [data-testid="stAppViewBlockContainer"] { opacity: 1 !important; filter: none !important; }
+    div.stChatMessage.st-emotion-cache-1c7y2kd { opacity: 1 !important; }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# =========================
+# HEADER
+# =========================
+st.title("📚 AI StudyMate")
+st.caption("Chat with your PDF, DOCX, PPTX, TXT or Images using AI")
+
+# =========================
+# SESSION MEMORY
+# =========================
+if "all_chats" not in st.session_state:
+    st.session_state.all_chats = load_chats()
+
+if "current_chat" not in st.session_state:
+    st.session_state.current_chat = list(st.session_state.all_chats.keys())[-1]
+
+messages = st.session_state.all_chats[st.session_state.current_chat]
+
+# =========================
+# SIDEBAR (LEFT PANEL)
+# =========================
+with st.sidebar:
+    # Top section for history
+    top_container = st.container()
+    with top_container:
+        st.title("🗂️ Chat History")
+        if st.button("➕ New Chat", use_container_width=True):
+            new_id = f"Chat {len(st.session_state.all_chats) + 1}"
+            st.session_state.all_chats[new_id] = []
+            st.session_state.current_chat = new_id
+            save_chats(st.session_state.all_chats)
+            st.rerun()
+
+        st.markdown("---")
+        for chat_name in list(st.session_state.all_chats.keys()):
+            display_name = chat_name if len(chat_name) <= 15 else chat_name[:12] + "..."
+            col1, col2 = st.columns([0.8, 0.2])
+            with col1:
+                if st.button(display_name, key=f"btn_{chat_name}", help=chat_name, use_container_width=True):
+                    st.session_state.current_chat = chat_name
+                    st.rerun()
+            with col2:
+                if st.button("🗑️", key=f"del_{chat_name}", help="Delete chat"):
+                    del st.session_state.all_chats[chat_name]
+                    if st.session_state.current_chat == chat_name:
+                        if len(st.session_state.all_chats) > 0:
+                            st.session_state.current_chat = list(st.session_state.all_chats.keys())[-1]
+                        else:
+                            st.session_state.all_chats = {"Chat 1": []}
+                            st.session_state.current_chat = "Chat 1"
+                    save_chats(st.session_state.all_chats)
+                    st.rerun()
+
+    # Bottom section for download button
+    bottom_container = st.container()
+    with bottom_container:
+        st.markdown("---")
+        chat_text = ""
+        for msg in messages:
+            role = "🧑 User" if msg["role"] == "user" else "🤖 AI"
+            chat_text += f"{role}: {msg['content']}\n\n"
+            
+        st.download_button(
+            label="📥 Download Chat",
+            data=chat_text,
+            file_name=f"AI_StudyMate - {st.session_state.current_chat}.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
+
+# =========================
+# UPLOAD SECTION & PROCESSING
+# =========================
+uploaded_file = st.file_uploader("📂 Upload your document", type=["pdf", "docx", "txt", "png", "jpg", "jpeg", "pptx"])
+vectorstore = None
+
+if uploaded_file:
+    st.success("File uploaded successfully!")
+    
+    if st.session_state.current_chat.startswith("Chat "):
+        old_chat_name = st.session_state.current_chat
+        new_chat_name = os.path.splitext(uploaded_file.name)[0]
+        
+        if new_chat_name not in st.session_state.all_chats:
+            st.session_state.all_chats[new_chat_name] = st.session_state.all_chats.pop(old_chat_name)
+            st.session_state.current_chat = new_chat_name
+            save_chats(st.session_state.all_chats)
+            st.rerun() 
+
+    text = ""
+    if uploaded_file.name.lower().endswith(".pdf"):
+        reader = PdfReader(uploaded_file)
+        for page in reader.pages:
+            if page.extract_text():
+                text += page.extract_text()
+    elif uploaded_file.name.lower().endswith(".docx"):
+        doc = Document(uploaded_file)
+        for para in doc.paragraphs:
+            text += para.text + "\n"
+    elif uploaded_file.name.lower().endswith(".txt"):
+        text = uploaded_file.read().decode()
+    elif uploaded_file.name.lower().endswith(".pptx"):
+        prs = Presentation(uploaded_file)
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    text += shape.text + "\n"
+    elif uploaded_file.name.lower().endswith((".png", ".jpg", ".jpeg")):
+        with st.spinner("🖼️ AI is reading your image..."):
+            img = Image.open(uploaded_file)
+            try:
+                vision_response = client.models.generate_content(
+                    model="models/gemini-2.5-flash",
+                    contents=[img, "Extract all the readable text from this image. Just return the text, no other explanation."]
+                )
+                text = vision_response.text
+            except Exception as e:
+                st.error(f"⚠️ Error reading image: {e}")
+                st.stop()
+
+    if not text.strip():
+        st.error("⚠️ Is document/image mein koi readable text nahi mila.")
+    else:
+        chunks = get_text_chunks(text)
+        vectorstore = get_vector_store(chunks)
+
+# =========================
+# CHAT DISPLAY
+# =========================
+st.markdown("---")
+for msg in messages:
+    if msg["role"] == "user":
+        st.markdown(f"<div class='user-bubble'>🧑 {msg['content']}</div>", unsafe_allow_html=True)
+    else:
+        st.markdown(f"<div class='ai-bubble'>🤖 {msg['content']}</div>", unsafe_allow_html=True)
+
+# =========================
+# CHAT INPUT & LOGIC
+# =========================
+user_question = st.chat_input("Ask anything from your document...")
+
+if user_question:
+    if vectorstore is None:
+        st.error("Please upload a document first!")
+        st.stop()
+
+    st.markdown(f"<div class='user-bubble'>🧑 {user_question}</div>", unsafe_allow_html=True)
+    chat_history_str = ""
+    for msg in messages[-4:]: 
+        role = "Student" if msg["role"] == "user" else "AI"
+        chat_history_str += f"{role}: {msg['content']}\n"
+
+    status_placeholder = st.empty()
+    status_placeholder.markdown("<div style='color: grey; margin: 10px 0;'>🤖 Analyzing document...</div>", unsafe_allow_html=True)
+
+    docs = vectorstore.similarity_search(user_question, k=3)
+    context = "\n".join([d.page_content for d in docs])
+
+    try:
+        response = client.models.generate_content(
+            model="models/gemini-2.5-flash",
+            contents=f"""
+You are a helpful study assistant.
+
+RULES:
+- Use ONLY the provided document context.
+- If answer not found say "not found in document"
+- Answer in simple English and Roman English
+- Do NOT use outside knowledge.
+- If the answer is not present in the context, say:
+  "I could not find this information in the uploaded document."
+- If the user asks in Roman English, answer in Roman English.
+- If the user asks in English, answer in English.
+
+PREVIOUS CHAT: {chat_history_str}
+DOCUMENT CONTEXT: {context}
+QUESTION: {user_question}
+"""
+        )
+        answer = response.text
+    except Exception as e:
+        status_placeholder.empty()
+        st.error(f"⚠️ Ek error aagaya: {e}")
+        st.stop()
+
+    status_placeholder.empty() 
+    st.session_state.all_chats[st.session_state.current_chat].append({"role": "user", "content": user_question})
+    st.session_state.all_chats[st.session_state.current_chat].append({"role": "assistant", "content": answer})
+    save_chats(st.session_state.all_chats)
+    st.rerun()
+
+
+
+
+
+
+
+to execute:
+streamlit run app.py
